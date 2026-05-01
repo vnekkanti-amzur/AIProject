@@ -94,7 +94,7 @@ async function streamChat(message, onToken) {
   }
 }
 
-async function streamChatForThread(threadId, message, onToken) {
+async function streamChatForThread(threadId, message, onToken, onTitle, onThreadCreated) {
   const res = await fetch(BASE + '/simple-chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -108,16 +108,28 @@ async function streamChatForThread(threadId, message, onToken) {
   let buffer = ''
 
   const flush = (raw) => {
+    let eventName = 'message'
     const dataLines = []
     for (const line of raw.split('\n')) {
-      if (line.startsWith('data:')) {
+      if (line.startsWith('event:')) {
+        eventName = line.slice(6).trim()
+      } else if (line.startsWith('data:')) {
         const text = line.startsWith('data: ') ? line.slice(6) : line.slice(5)
         dataLines.push(text)
       }
     }
     if (dataLines.length === 0) return
     const joined = dataLines.join('\n')
-    if (joined !== '[DONE]') onToken(joined)
+    if (eventName === 'thread') {
+      if (onThreadCreated) onThreadCreated(joined)
+      return
+    }
+    if (eventName === 'title') {
+      if (onTitle) onTitle(joined)
+      return
+    }
+    if (eventName === 'done' || joined === '[DONE]') return
+    onToken(joined)
   }
 
   for (;;) {
@@ -419,19 +431,9 @@ function ChatPage({ userEmail, onLogout }) {
     setInput('')
     setError(null)
 
+    // No pre-creation: backend will create the thread on first send
+    // and emit `event: thread` with the new id, then `event: title` with an LLM-generated name.
     let threadId = activeThreadId
-    if (!threadId) {
-      try {
-        const t = await createThread(text)
-        setThreads((prev) => [t, ...prev])
-        justCreatedRef.current = true
-        setActiveThreadId(t.id)
-        threadId = t.id
-      } catch (err) {
-        setError(err.message)
-        return
-      }
-    }
 
     const userMsg = { id: crypto.randomUUID(), role: 'user', content: text }
     const assistantId = crypto.randomUUID()
@@ -440,18 +442,42 @@ function ChatPage({ userEmail, onLogout }) {
     setLoading(true)
 
     try {
-      await streamChatForThread(threadId, text, (token) => {
-        setMessages((prev) =>
-          prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + token } : m))
-        )
-      })
+      await streamChatForThread(
+        threadId,
+        text,
+        (token) => {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + token } : m))
+          )
+        },
+        (newTitle) => {
+          if (!threadId) return
+          setThreads((prev) =>
+            prev.map((t) => (t.id === threadId ? { ...t, title: newTitle } : t))
+          )
+        },
+        (newThreadId) => {
+          // Backend just created a thread for us. Add it to the sidebar and mark active.
+          threadId = newThreadId
+          justCreatedRef.current = true
+          setActiveThreadId(newThreadId)
+          const now = new Date().toISOString()
+          setThreads((prev) => [
+            { id: newThreadId, title: 'New Chat', created_at: now, updated_at: now },
+            ...prev,
+          ])
+        }
+      )
 
-      setThreads((prev) => {
-        const found = prev.find((t) => t.id === threadId)
-        if (!found) return prev
-        const updated = { ...found, updated_at: new Date().toISOString() }
-        return [updated, ...prev.filter((t) => t.id !== threadId)]
-      })
+      if (threadId) {
+        const finalThreadId = threadId
+        setThreads((prev) => {
+          const found = prev.find((t) => t.id === finalThreadId)
+          if (!found) return prev
+          const updated = { ...found, updated_at: new Date().toISOString() }
+          return [updated, ...prev.filter((t) => t.id !== finalThreadId)]
+        })
+      }
     } catch (err) {
       setError(err.message)
       setMessages((prev) => prev.filter((m) => m.id !== assistantId))

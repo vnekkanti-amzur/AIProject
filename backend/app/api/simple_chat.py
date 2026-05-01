@@ -13,6 +13,7 @@ from app.db.session import get_db
 from app.models.message import Message
 from app.models.thread import Thread
 from app.services import chat_service
+from app.services.thread_service import generate_title
 
 router = APIRouter()
 
@@ -58,15 +59,48 @@ def _auto_title(first_message: str | None) -> str:
 
 
 async def _sse_stream(
-    message: str, user_email: str, db: AsyncSession, thread_id: str
+    message: str,
+    user_email: str,
+    db: AsyncSession,
+    thread_id: str,
+    auto_title: bool,
+    is_new_thread: bool,
 ) -> AsyncIterator[str]:
+    if is_new_thread:
+        yield f"event: thread\ndata: {thread_id}\n\n"
+
+    assistant_parts: list[str] = []
     async for token in chat_service.stream_response(
         message, [], user_email, db, thread_id=thread_id
     ):
+        assistant_parts.append(token)
         safe = token.replace("\r", "")
         for line in safe.split("\n"):
             yield f"data: {line}\n"
         yield "\n"
+
+    if auto_title:
+        try:
+            new_title = await generate_title(message, "".join(assistant_parts), user_email)
+        except Exception:
+            new_title = ""
+        if new_title:
+            try:
+                thread_uuid = uuid.UUID(thread_id)
+                row = await db.scalar(
+                    select(Thread).where(
+                        Thread.id == thread_uuid,
+                        Thread.user_email == user_email,
+                    )
+                )
+                if row is not None:
+                    row.title = new_title
+                    await db.commit()
+                    safe_title = new_title.replace("\r", "").replace("\n", " ")
+                    yield f"event: title\ndata: {safe_title}\n\n"
+            except Exception:
+                pass
+
     yield "event: done\ndata: [DONE]\n\n"
 
 
@@ -76,15 +110,19 @@ async def simple_chat(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
+    auto_title = False
+    is_new_thread = False
     if payload.thread_id is None:
         thread = Thread(
             id=uuid.uuid4(),
             user_email=current_user["email"],
-            title=_auto_title(payload.message),
+            title="New Chat",
         )
         db.add(thread)
         await db.commit()
         thread_id = str(thread.id)
+        auto_title = True
+        is_new_thread = True
     else:
         try:
             thread_uuid = uuid.UUID(payload.thread_id)
@@ -100,9 +138,13 @@ async def simple_chat(
         if thread_row is None:
             raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Thread not found"})
         thread_id = payload.thread_id
+        # Also auto-name if existing thread still has the placeholder/auto-truncated title
+        # AND has no prior assistant messages yet.
+        if thread_row.title in (None, "", "New Chat"):
+            auto_title = True
 
     return StreamingResponse(
-        _sse_stream(payload.message, current_user["email"], db, thread_id),
+        _sse_stream(payload.message, current_user["email"], db, thread_id, auto_title, is_new_thread),
         media_type="text/event-stream",
     )
 
