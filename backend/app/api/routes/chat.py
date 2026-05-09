@@ -23,6 +23,7 @@ async def stream_chat(
             current_user["email"],
             db,
             payload.thread_id,
+            [item.stored_name for item in payload.attachments],
         ),
         media_type="text/event-stream",
     )

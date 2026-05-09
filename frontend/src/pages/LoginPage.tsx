@@ -3,6 +3,14 @@ import { useNavigate } from 'react-router-dom';
 import { GoogleLoginButton } from '../components/auth/GoogleLoginButton';
 import { login, register } from '../lib/api';
 
+type ApiError = {
+  response?: {
+    data?: {
+      detail?: string | { message?: string };
+    };
+  };
+};
+
 export default function LoginPage() {
   const navigate = useNavigate();
   const [mode, setMode] = useState<'login' | 'register'>('login');
@@ -21,7 +29,13 @@ export default function LoginPage() {
       }
       navigate('/chat');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Auth failed');
+      const apiErr = err as ApiError;
+      const detail = apiErr.response?.data?.detail;
+      const message =
+        typeof detail === 'string'
+          ? detail
+          : detail?.message ?? (err instanceof Error ? err.message : 'Auth failed');
+      setError(message);
     }
   };
 

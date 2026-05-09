@@ -1,4 +1,5 @@
 from sqlalchemy import String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -11,3 +12,4 @@ class Message(TimestampMixin, Base):
     user_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(50), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    attachments: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)

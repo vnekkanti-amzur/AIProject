@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     CHROMA_PERSIST_DIR: str = "./chroma_db"
     GOOGLE_SERVICE_ACCOUNT_JSON: str | None = None
 
+    SUPABASE_URL: str = ""
+    SUPABASE_ANON_KEY: str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
+
     MAX_UPLOAD_MB: int = 20
     UPLOAD_DIR: str = "./uploads"
 

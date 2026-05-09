@@ -20,7 +20,7 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
-_pwd = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+_pwd = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")
 
 
 def _ensure_amzur_email(email: str) -> None:
@@ -83,6 +83,11 @@ async def login_user(db: AsyncSession, payload: LoginRequest, response: Response
             status_code=401,
             detail={"error": "invalid_credentials", "message": "Invalid email or password"},
         )
+
+    # Transparently upgrade legacy password hashes after a successful login.
+    if _pwd.needs_update(user.hashed_password):
+        user.hashed_password = _pwd.hash(payload.password)
+        await db.commit()
 
     set_auth_cookie(response, create_jwt(user.email))
     return UserResponse(email=user.email)
