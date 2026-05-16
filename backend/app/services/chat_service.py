@@ -309,9 +309,11 @@ async def _build_human_content_blocks(
     attachment_names: list[str],
     db: AsyncSession | None = None,
     thread_id: str | None = None,
-) -> list[dict[str, str | dict[str, str]]]:
+    user_id: str | None = None,
+) -> tuple[list[dict[str, str | dict[str, str]]], bool]:
     content_blocks: list[dict[str, str | dict[str, str]]] = [{"type": "text", "text": message}]
     attached_text_parts: list[str] = []
+    rag_context_added = False  # Initialize flag for RAG context tracking
 
     for stored_name in attachment_names:
         file_path = _resolve_attachment_path(user_email, stored_name)
@@ -393,7 +395,30 @@ async def _build_human_content_blocks(
         except Exception as e:
             logger.warning(f"Failed to extract images from recent messages: {e}", exc_info=True)
 
-    return content_blocks
+    # Retrieve RAG context from uploaded PDF documents
+    rag_context_added = False
+    if user_id:
+        try:
+            from app.services import rag_service
+            retrieved_chunks = await rag_service.retrieve_relevant_chunks(
+                query=message,
+                user_id=user_id,
+                k=5,  # Retrieve top 5 relevant chunks
+            )
+            
+            if retrieved_chunks:
+                rag_context = rag_service.format_retrieved_chunks_for_prompt(retrieved_chunks)
+                # Add RAG context directly without headers that trigger LLM preambles
+                content_blocks.append({
+                    "type": "text",
+                    "text": f"\n\nDocument Context:\n{rag_context}\n\nAnswer the question using ONLY the above content. Do NOT add preambles or explanations.",
+                })
+                rag_context_added = True
+                logger.info(f"Added RAG context with {len(retrieved_chunks)} chunks to the prompt")
+        except Exception as e:
+            logger.warning(f"Failed to retrieve RAG context: {e}", exc_info=True)
+
+    return content_blocks, rag_context_added
 
 
 async def store_uploads(files: list[IncomingUpload], user_email: str) -> list[StoredUpload]:
@@ -774,7 +799,19 @@ async def stream_response(
     db: AsyncSession,
     thread_id: str | None = None,
     attachment_names: list[str] | None = None,
+    user_id: str | None = None,
 ) -> AsyncIterator[str]:
+    if not user_id:
+        try:
+            from sqlalchemy import select
+            from app.models.user import User
+
+            user_row = await db.scalar(select(User.id).where(User.email == user_email))
+            if user_row is not None:
+                user_id = str(user_row)
+        except Exception:
+            logger.warning("Unable to resolve user_id for RAG retrieval", exc_info=True)
+
     # Resolve / create thread for this user.
     if thread_id:
         thread = await thread_service.get_thread(db, user_email, thread_id)
@@ -873,51 +910,64 @@ async def stream_response(
         [m.type for m in chat_history],
     )
 
-    # Deterministic memory recall avoids unrelated fact drift for direct memory prompts.
-    if fact_query_key is not None:
-        specific_answer = await _build_specific_fact_answer(
-            db,
-            str(thread.id),
-            user_email,
-            fact_query_key,
-        )
-        answer = specific_answer or f"I do not remember your {fact_query_key} yet. Please tell me and I will remember it."
-        yield answer
-        db.add(
-            Message(
-                thread_id=str(thread.id),
-                user_email=user_email,
-                role="assistant",
-                content=answer,
-                attachments=None,
-            )
-        )
-        await db.commit()
-        return
-
-    if is_memory_list:
-        answer = await _build_memory_list_answer(db, str(thread.id), user_email)
-        yield answer
-        db.add(
-            Message(
-                thread_id=str(thread.id),
-                user_email=user_email,
-                role="assistant",
-                content=answer,
-                attachments=None,
-            )
-        )
-        await db.commit()
-        return
-
+    # Check for RAG context FIRST before handling fact queries
+    # This ensures RAG answers take priority over cached memory
     chain = build_chat_chain()
-    human_content = await _build_human_content_blocks(
+    human_content, rag_context_added = await _build_human_content_blocks(
         message,
         user_email,
         attachment_names or [],
         db=db,
         thread_id=str(thread.id),
+        user_id=user_id,
     )
+
+    # If RAG context is available, use it even for fact queries
+    # (documents take priority over chat memory)
+    if rag_context_added:
+        logger.info("DEBUG: RAG context found, using LLM to answer with document context")
+    else:
+        # Only use memory fact lookups if NO RAG context is available
+        if fact_query_key is not None:
+            specific_answer = await _build_specific_fact_answer(
+                db,
+                str(thread.id),
+                user_email,
+                fact_query_key,
+            )
+            answer = specific_answer or f"I do not remember your {fact_query_key} yet. Please tell me and I will remember it."
+            yield answer
+            db.add(
+                Message(
+                    thread_id=str(thread.id),
+                    user_email=user_email,
+                    role="assistant",
+                    content=answer,
+                    attachments=None,
+                )
+            )
+            await db.commit()
+            return
+
+        if is_memory_list:
+            answer = await _build_memory_list_answer(db, str(thread.id), user_email)
+            yield answer
+            db.add(
+                Message(
+                    thread_id=str(thread.id),
+                    user_email=user_email,
+                    role="assistant",
+                    content=answer,
+                    attachments=None,
+                )
+            )
+            await db.commit()
+            return
+    
+    # When RAG context is available, clear chat history to ensure LLM uses ONLY the document context
+    if rag_context_added:
+        logger.info("DEBUG: RAG context added, clearing chat history to use only document context")
+        chat_history = []
 
     human_messages = [HumanMessage(content=human_content)]
     assistant_parts: list[str] = []
